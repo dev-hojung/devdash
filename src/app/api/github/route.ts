@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const GITHUB_API = "https://api.github.com";
+const GITHUB_GRAPHQL_API = "https://api.github.com/graphql";
 
 function headers(): HeadersInit {
   const h: HeadersInit = {
@@ -22,11 +23,70 @@ async function ghFetch(url: string) {
   return res.json();
 }
 
-// ─── 커밋 히트맵 데이터 (최근 1년 이벤트 기반) ─────────────────────────
-async function fetchCommits(username: string) {
-  // GitHub Events API는 최근 90일/300건만 제공하므로,
-  // Search API로 커밋 수를 날짜별로 조회하기엔 rate limit 이슈가 있음.
-  // 대안: Events API에서 PushEvent를 수집하고, 나머지는 0으로 채운다.
+// ─── 커밋 히트맵 데이터 (GraphQL contributionsCollection 기반) ────────────
+async function fetchCommitsViaGraphQL(username: string): Promise<{ date: string; count: number }[]> {
+  const query = `
+    query($username: String!) {
+      user(login: $username) {
+        contributionsCollection {
+          contributionCalendar {
+            totalContributions
+            weeks {
+              contributionDays {
+                contributionCount
+                date
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await fetch(GITHUB_GRAPHQL_API, {
+    method: "POST",
+    headers: {
+      ...headers(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables: { username } }),
+    next: { revalidate: 300 },
+  });
+
+  if (!res.ok) {
+    throw new Error(`GitHub GraphQL API error: ${res.status} ${res.statusText}`);
+  }
+
+  const json = await res.json();
+
+  if (json.errors) {
+    throw new Error(`GitHub GraphQL error: ${json.errors[0]?.message ?? "Unknown error"}`);
+  }
+
+  const weeks: Array<{
+    contributionDays: Array<{ contributionCount: number; date: string }>;
+  }> = json.data?.user?.contributionsCollection?.contributionCalendar?.weeks ?? [];
+
+  const heatmap: { date: string; count: number }[] = [];
+  for (const week of weeks) {
+    for (const day of week.contributionDays) {
+      heatmap.push({ date: day.date, count: day.contributionCount });
+    }
+  }
+
+  // 최근 365일 기준으로 필터링 및 정렬
+  const today = new Date();
+  const cutoff = new Date(today);
+  cutoff.setDate(cutoff.getDate() - 364);
+  const cutoffStr = cutoff.toISOString().split("T")[0];
+
+  return heatmap
+    .filter((d) => d.date >= cutoffStr)
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// ─── 커밋 히트맵 데이터 (REST Events API 폴백) ───────────────────────────
+async function fetchCommitsViaEvents(username: string): Promise<{ date: string; count: number }[]> {
   const events: Array<{ type: string; created_at: string; payload: { commits?: unknown[] } }> = [];
 
   // 최대 10페이지 (300건)
@@ -46,7 +106,7 @@ async function fetchCommits(username: string) {
   for (const ev of events) {
     if (ev.type === "PushEvent" && ev.payload.commits) {
       const date = ev.created_at.split("T")[0];
-      commitMap[date] = (commitMap[date] || 0) + ev.payload.commits.length;
+      commitMap[date] = (commitMap[date] || 0) + (ev.payload.commits as unknown[]).length;
     }
   }
 
@@ -61,6 +121,15 @@ async function fetchCommits(username: string) {
   }
 
   return heatmap;
+}
+
+async function fetchCommits(username: string) {
+  try {
+    return await fetchCommitsViaGraphQL(username);
+  } catch {
+    // GraphQL 실패 시 REST Events API로 폴백
+    return await fetchCommitsViaEvents(username);
+  }
 }
 
 // ─── PR 목록 ────────────────────────────────────────────────────────
